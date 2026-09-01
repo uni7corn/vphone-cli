@@ -36,6 +36,10 @@ VM_DIR="$(cd "$VM_DIR" && pwd)"
 # `make cfw_install` standalone (without setup_machine.sh exporting PATH)
 # still uses the correctly set-up venv interpreter.
 _resolve_python3() {
+    if [[ -n "${VPHONE_PYTHON:-}" ]]; then
+        echo "$VPHONE_PYTHON"
+        return
+    fi
     local venv_py="${SCRIPT_DIR:h}/.venv/bin/python3"
     if [[ -x "$venv_py" ]]; then
         echo "$venv_py"
@@ -67,6 +71,16 @@ check_prerequisites() {
 ldid_sign() {
     local file="$1" bundle_id="${2:-}"
     local args=(-S -M "-K$VM_DIR/$CFW_INPUT/signcert.p12")
+    [[ -n "$bundle_id" ]] && args+=("-I$bundle_id")
+    ldid "${args[@]}" "$file"
+}
+
+# Like ldid_sign but re-applies an entitlements plist (for binaries whose
+# entitlements must survive the re-sign, e.g. diskimagesiod's embedded sandbox
+# profile + private DA/apfs entitlements).
+ldid_sign_ent() {
+    local file="$1" ent="$2" bundle_id="${3:-}"
+    local args=("-S$ent" -M "-K$VM_DIR/$CFW_INPUT/signcert.p12")
     [[ -n "$bundle_id" ]] && args+=("-I$bundle_id")
     ldid "${args[@]}" "$file"
 }
@@ -124,7 +138,7 @@ setup_cfw_input() {
         archive="$search_dir/$CFW_ARCHIVE"
         if [[ -f "$archive" ]]; then
             echo "  Extracting $CFW_ARCHIVE..."
-            tar --zstd -xf "$archive" -C "$VM_DIR"
+            "$TAR" --zstd --warning=no-unknown-keyword -xf "$archive" -C "$VM_DIR"
             return
         fi
     done
@@ -283,17 +297,91 @@ else
     echo "  [+] Cryptex installed"
 fi
 
-# iOS 26.0 and 26.0.1 IOMobileFramebuffer send the older 0x548-byte SwapEnd
-# payload, but the PCC vphone600 userclient rejects anything below the
-# 26.1-era 0x560 layout. Patch only that immediate in the installed 26.0 or 26.0.1
-# DSC; do not replace frameworks or normalize GPU metadata.
+# Some userland versions send an IOMobileFramebuffer SwapEnd state whose size
+# differs from what the PCC vphone600 userclient expects (an exact
+# checkStructureInputSize check), so SwapEnd returns kIOReturnBadArgument and
+# the host VZ display stays black (guest still renders; visible over VNC).
+#
+# The accepted size is a property of the BASE KERNEL, not the userland:
+#   - 26.1 base: userclient expects 0x560
+#   - 26.4 base (xnu-12377, current): userclient expects 0x588
+# Reliably reading it from the kernelcache needs the IOMFB userclient dispatch
+# table (a blind shape-scan is ambiguous — 8 candidates), so until that dynamic
+# detection lands we key the target off the userland version as a proxy for the
+# validated base pairing:
+#   - 27.x runs on the 26.4 base           -> 0x588
+#   - 26.0/26.0.1 and 18.x validated on 26.1 base -> 0x560
+# Known userland-sent sizes: 18.x -> 0x514, 26.0/26.0.1 -> 0x548, 27.0 -> 0x6e0.
+# Patch only that immediate in the installed DSC; the patcher is semantic +
+# idempotent (rewrites the SwapEnd size to the target, no-op if already there).
+# NOTE: iOS 27 is NOT handled by the size-truncation path — its swap struct
+# (0x6e0) has a new layout, and more fundamentally 27 defaults the paravirt
+# display's present to IOMFB's `_virt_*` callback path, which never enters the
+# userclient at all (method 5 is never called), so no size change would help.
+# iOS 27 instead gets `patch-iomfb-force-kern` below, which retargets IOMFB's
+# public Swap* trampolines to their `_kern_*` (method-5) siblings — the path the
+# 26.4 paravirt GPU scans out to the host — paired with the KernelJBPatchIomfbSwap
+# kernel patches that make the userclient accept 27's native 0x6e0 struct.
 IOS_VERSION=$(/usr/bin/plutil -extract ProductVersion raw -o - "$MNT1/System/Library/CoreServices/SystemVersion.plist" 2>/dev/null || true)
-if [[ "$IOS_VERSION" == 26.0* ]]; then
-    echo "  [*] Patching 26.0/26.0.1 IOMobileFramebuffer SwapEnd payload size..."
-    DSC_DIR="$MNT1/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld"
+DSC_DIR="$MNT1/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld"
+IOMFB_TARGET=""
+case "$IOS_VERSION" in
+    26.0*|18.*) IOMFB_TARGET=0x560 ;;
+esac
+if [[ -n "$IOMFB_TARGET" ]]; then
+    echo "  [*] Patching IOMobileFramebuffer SwapEnd payload size (iOS $IOS_VERSION -> $IOMFB_TARGET)..."
     [[ -d "$DSC_DIR" ]] || die "dyld cache dir missing: $DSC_DIR"
-    "$PYTHON3" "$SCRIPT_DIR/patchers/cfw.py" patch-iomfb-swapend "$DSC_DIR"
+    "$PYTHON3" "$SCRIPT_DIR/patchers/cfw.py" patch-iomfb-swapend "$DSC_DIR" --target-size "$IOMFB_TARGET"
 fi
+case "$IOS_VERSION" in
+    27.*)
+        echo "  [*] Forcing IOMobileFramebuffer present onto the kern (method-5) path (iOS $IOS_VERSION)..."
+        [[ -d "$DSC_DIR" ]] || die "dyld cache dir missing: $DSC_DIR"
+        "$PYTHON3" "$SCRIPT_DIR/patchers/cfw.py" patch-iomfb-force-kern "$DSC_DIR"
+        ;;
+esac
+
+# iOS-27-only DSC patches (hard-gated — a 26.x/18.x base applies neither).
+#  - maxSlide: iOS 27's dyld shared cache nearly fills the vphone600 26.x kernel's
+#    fixed 6 GiB shared region. The kernel reserves the cache's mapped span PLUS the
+#    cache-header maxSlide (512 MiB); iOS 27.0 (~5.95 GiB span + 512 MiB) overflows
+#    0x180000000, so _shared_region_map_and_slide returns ENOMEM, dyld cannot map
+#    libSystem, and launchd (pid 1) panics at boot. Zero maxSlide so the cache maps
+#    at slide 0. (The patcher also self-gates on the actual span, but older userlands
+#    fit with full slide and never need it — so it is not run there at all.)
+#  - lsd embedded-registration gate: opens lsd's containerized-registration path so
+#    the iOS-27 vpregister first-boot tool can register JB apps (uicache's
+#    registerApplicationDictionary is a no-op stub on 27). Not needed on 26.x/18.x,
+#    where uicache registers apps normally.
+#  - xpc LWCR self-check: iOS 27's libxpc brk-aborts when its Lightweight Code
+#    Requirement matcher returns the contradictory (matched=0, error_code=MATCH) pair
+#    that our JB code-signing environment produces. That crash-loops every daemon which
+#    pins an entitlement peer-requirement (intelligencetasksd/searchpartyd/transparencyd/
+#    bluetoothd/...). Absent on 26.x/18.x libxpc (self-gating patcher no-ops there).
+# FORCE_DSC_MAXSLIDE=1 (default 0): opt in to zeroing maxSlide on non-27 bases,
+# whose caches fit and would otherwise self-gate to a no-op (--force bypasses that).
+DSC_DIR="$MNT1/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld"
+FORCE_DSC_MAXSLIDE="${FORCE_DSC_MAXSLIDE:-0}"
+case "$IOS_VERSION" in
+    27.*)
+        if [[ -d "$DSC_DIR" ]]; then
+            echo "  [*] Checking dyld cache maxSlide vs kernel shared region..."
+            "$PYTHON3" "$SCRIPT_DIR/patchers/cfw.py" patch-dsc-maxslide "$DSC_DIR"
+            echo "  [*] Patching lsd embedded-registration gate (iOS 27 app registration)..."
+            "$PYTHON3" "$SCRIPT_DIR/patchers/cfw.py" patch-lsd-embedded-reg "$DSC_DIR"
+            echo "  [*] Patching libxpc LWCR self-check (iOS 27 daemon crash-loop)..."
+            "$PYTHON3" "$SCRIPT_DIR/patchers/cfw.py" patch-xpc-lwcr "$DSC_DIR"
+            echo "  [*] Patching os_lockdown_mode_enabled (missing MAC sysctl -> launchd abort)..."
+            "$PYTHON3" "$SCRIPT_DIR/patchers/cfw.py" patch-lockdown-mode "$DSC_DIR"
+        fi
+        ;;
+    *)
+        if [[ "$FORCE_DSC_MAXSLIDE" == "1" && -d "$DSC_DIR" ]]; then
+            echo "  [*] Forcing dyld cache maxSlide=0 (opt-in FORCE_DSC_MAXSLIDE=1; base iOS ${IOS_VERSION:-unknown})..."
+            "$PYTHON3" "$SCRIPT_DIR/patchers/cfw.py" patch-dsc-maxslide "$DSC_DIR" --force
+        fi
+        ;;
+esac
 
 # ═══════════ 2/7 PATCH SEPUTIL ════════════════════════════════
 echo ""
@@ -311,6 +399,31 @@ ldid_sign "$TEMP_DIR/seputil" "com.apple.seputil"
 cp -R "$TEMP_DIR/seputil" "$MNT1/usr/libexec/seputil"
 /bin/chmod 0755 $MNT1/usr/libexec/seputil
 
+# ── DDI (/System/Developer) auto-mount — diskimagesiod (iOS 27 only) ──
+# Force -[DIDiskArb isMountCompleteWithExpectedCount:diskTracker:] → YES so
+# MobileStorageMounter proceeds to mount the iOS-27 personalized DDI (its
+# waitForDAMount otherwise hangs forever on the 26.4 vphone600 hybrid: only some
+# IOMedia appear to diskimagesiod's DA session + DA never auto-mounts). Pairs
+# with the DiskImages2 ABI + sandbox mac_policy_ops[124] JB kernel patches.
+# Entitlements (embedded sandbox profile + private DA/apfs) preserved on re-sign.
+# Gated to 27.*: on a version-matched userland the native waitForDAMount completes
+# correctly, and forcing the wait to return early could race the real mount — so
+# it is NOT applied there (uses the same $IOS_VERSION as the DSC patches above).
+case "$IOS_VERSION" in
+    27.*)
+        echo "  Patching diskimagesiod (DDI auto-mount, iOS $IOS_VERSION)..."
+        if ! [[ -e "$MNT1/usr/libexec/diskimagesiod.bak" ]]; then
+            /bin/cp "$MNT1/usr/libexec/diskimagesiod" "$MNT1/usr/libexec/diskimagesiod.bak"
+        fi
+        ldid -e "$MNT1/usr/libexec/diskimagesiod.bak" > "$TEMP_DIR/diskimagesiod.ent.plist"
+        cp "$MNT1/usr/libexec/diskimagesiod.bak" "$TEMP_DIR/diskimagesiod"
+        "$PYTHON3" "$SCRIPT_DIR/patchers/cfw.py" patch-diskimagesiod "$TEMP_DIR/diskimagesiod"
+        ldid_sign_ent "$TEMP_DIR/diskimagesiod" "$TEMP_DIR/diskimagesiod.ent.plist" "com.apple.diskimagesiod"
+        cp -R "$TEMP_DIR/diskimagesiod" "$MNT1/usr/libexec/diskimagesiod"
+        /bin/chmod 0755 "$MNT1/usr/libexec/diskimagesiod"
+        ;;
+esac
+
 # Rename gigalocker (mv to same name is fine on re-run)
 echo "  Renaming gigalocker..."
 mount_vol s3 "$MNT3"
@@ -323,7 +436,7 @@ echo ""
 echo "[3/7] Installing AppleParavirtGPUMetalIOGPUFamily..."
 
 cp -R "$INPUT_DIR/custom/AppleParavirtGPUMetalIOGPUFamily.tar" "$MNT1"
-"$TAR" --preserve-permissions --no-overwrite-dir \
+"$TAR" --preserve-permissions --no-overwrite-dir --warning=no-unknown-keyword \
     -xf $MNT1/AppleParavirtGPUMetalIOGPUFamily.tar -C $MNT1
 
 BUNDLE="$MNT1/System/Library/Extensions/AppleParavirtGPUMetalIOGPUFamily.bundle"
@@ -345,7 +458,7 @@ echo ""
 echo "[4/7] Installing iosbinpack64..."
 
 cp -R "$INPUT_DIR/jb/iosbinpack64.tar" "$MNT1"
-"$TAR" --preserve-permissions --no-overwrite-dir \
+"$TAR" --preserve-permissions --no-overwrite-dir --warning=no-unknown-keyword \
     -xf $MNT1/iosbinpack64.tar -C $MNT1
 /bin/rm -f $MNT1/iosbinpack64.tar
 
@@ -468,14 +581,8 @@ echo "[*] Unmounting image volumes..."
 /sbin/umount $MNT1 2>/dev/null || true
 /sbin/umount $MNT3 2>/dev/null || true
 
-# Keep .cfw_temp/Cryptex*.dmg cached (slow to re-create)
-# Only remove temp binaries
-echo "[*] Cleaning up temp binaries..."
-rm -f "$TEMP_DIR/seputil" \
-    "$TEMP_DIR/launchd_cache_loader" \
-    "$TEMP_DIR/mobileactivationd" \
-    "$TEMP_DIR/vphoned" \
-    "$TEMP_DIR/launchd.plist"
+echo "[*] Cleaning up temp..."
+rm -rf "$TEMP_DIR"
 
 echo ""
 echo "[+] CFW installation complete!"

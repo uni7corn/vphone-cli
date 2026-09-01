@@ -31,6 +31,10 @@ VM_DIR="$(cd "$VM_DIR" && pwd)"
 
 # ── Python resolver — prefer project venv over whatever is in PATH ─
 _resolve_python3() {
+    if [[ -n "${VPHONE_PYTHON:-}" ]]; then
+        echo "$VPHONE_PYTHON"
+        return
+    fi
     local venv_py="${SCRIPT_DIR:h}/.venv/bin/python3"
     if [[ -x "$venv_py" ]]; then
         echo "$venv_py"
@@ -300,16 +304,38 @@ safe_detach "$MNT_APPOS"
 
 echo "  [+] Cryptex installed"
 
-# iOS 26.0 and 26.0.1 IOMobileFramebuffer send the older 0x548-byte SwapEnd
-# payload, but the PCC vphone600 userclient rejects anything below the
-# 26.1-era 0x560 layout. Patch only that immediate in the installed 26.0 or 26.0.1
-# DSC; do not replace frameworks or normalize GPU metadata.
+# Some userland versions send an IOMobileFramebuffer SwapEnd state whose size
+# differs from what the PCC vphone600 userclient expects (an exact
+# checkStructureInputSize check), so SwapEnd returns kIOReturnBadArgument and
+# the host VZ display stays black (guest still renders; visible over VNC).
+#
+# The accepted size is a property of the BASE KERNEL, not the userland:
+#   - 26.1 base: userclient expects 0x560
+#   - 26.4 base (xnu-12377, current): userclient expects 0x588
+# Reliably reading it from the kernelcache needs the IOMFB userclient dispatch
+# table (a blind shape-scan is ambiguous — 8 candidates), so until that dynamic
+# detection lands we key the target off the userland version as a proxy for the
+# validated base pairing:
+#   - 27.x runs on the 26.4 base           -> 0x588
+#   - 26.0/26.0.1 and 18.x validated on 26.1 base -> 0x560
+# Known userland-sent sizes: 18.x -> 0x514, 26.0/26.0.1 -> 0x548, 27.0 -> 0x6e0.
+# Patch only that immediate in the installed DSC; the patcher is semantic +
+# idempotent (rewrites the SwapEnd size to the target, no-op if already there).
+# NOTE: iOS 27 is intentionally NOT truncated here — its swap struct (0x6e0) has
+# a new layout, so size-truncation to 0x588 feeds the kernel misaligned data.
+# Instead the JB kernel patch `patchIomfbSwapEndVariableSize` makes the userclient
+# accept iOS 27's native 0x6e0 struct (variable-size dispatch), so 27 must send
+# its native size — leave it unpatched here.
 IOS_VERSION=$(/usr/bin/plutil -extract ProductVersion raw -o - "$MNT1/System/Library/CoreServices/SystemVersion.plist" 2>/dev/null || true)
-if [[ "$IOS_VERSION" == 26.0* ]]; then
-    echo "  [*] Patching 26.0/26.0.1 IOMobileFramebuffer SwapEnd payload size..."
+IOMFB_TARGET=""
+case "$IOS_VERSION" in
+    26.0*|18.*) IOMFB_TARGET=0x560 ;;
+esac
+if [[ -n "$IOMFB_TARGET" ]]; then
+    echo "  [*] Patching IOMobileFramebuffer SwapEnd payload size (iOS $IOS_VERSION -> $IOMFB_TARGET)..."
     DSC_DIR="$MNT1/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld"
     [[ -d "$DSC_DIR" ]] || die "dyld cache dir missing: $DSC_DIR"
-    "$PYTHON3" "$SCRIPT_DIR/patchers/cfw.py" patch-iomfb-swapend "$DSC_DIR"
+    "$PYTHON3" "$SCRIPT_DIR/patchers/cfw.py" patch-iomfb-swapend "$DSC_DIR" --target-size "$IOMFB_TARGET"
 fi
 
 # ═══════════ 2/7 PATCH SEPUTIL ════════════════════════════════
@@ -482,14 +508,8 @@ echo "[*] Unmounting image volumes..."
 /sbin/umount $MNT1 2>/dev/null || true
 /sbin/umount $MNT3 2>/dev/null || true
 
-# Keep .cfw_temp/Cryptex*.dmg cached (slow to re-create)
-# Only remove temp binaries
-echo "[*] Cleaning up temp binaries..."
-rm -f "$TEMP_DIR/seputil" \
-    "$TEMP_DIR/launchd_cache_loader" \
-    "$TEMP_DIR/mobileactivationd" \
-    "$TEMP_DIR/vphoned" \
-    "$TEMP_DIR/launchd.plist"
+echo "[*] Cleaning up temp..."
+rm -rf "$TEMP_DIR"
 
 echo ""
 echo "[+] CFW installation complete!"
